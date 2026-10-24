@@ -21,6 +21,7 @@ local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", RESETTI
 local state = STATE.IDLE
 
 local bagFullThisRound = false
+local resetDoneThisRound = false
 local latestCoins = 0
 local latestMaxCoins = 0
 local firedThisRound = {}
@@ -30,6 +31,7 @@ local charAtResetStart = nil
 
 local KILL_COOLDOWN = 1.0
 local RESETTING_TIMEOUT = 8.0
+local MIN_ROUND_AGE_FOR_RESET = 5.0
 
 local function log(...) print("[Assassin]", ...) end
 
@@ -74,7 +76,6 @@ local function getKillPart(character)
         or character:FindFirstChild("HumanoidRootPart")
 end
 
--- Assassin mode: alive == has a Knife. Dead players lose the tool.
 local function getLivingOthers()
     local list = {}
     for _, p in ipairs(Players:GetPlayers()) do
@@ -121,7 +122,17 @@ local function killTarget(name)
     return false
 end
 
-local function resetCharacter()
+-- Hard-guarded reset: only called from WAITING + bagFull path.
+local function resetCharacter(roundAge)
+    if not autoKillEnabled then return end
+    if state ~= STATE.WAITING then return end
+    if not bagFullThisRound then return end
+    if resetDoneThisRound then return end
+    if (roundAge or 0) < MIN_ROUND_AGE_FOR_RESET then
+        log("reset blocked — round too fresh (" .. string.format("%.1f", roundAge or 0) .. "s)")
+        return
+    end
+    resetDoneThisRound = true
     log("Attempting character reset")
     local char = player.Character
     if not char then return end
@@ -150,8 +161,13 @@ end
 
 local function startNewRound(source)
     if not autoKillEnabled then return end
+    if state == STATE.RESETTING then
+        log("Round start ignored — still resetting")
+        return
+    end
     log("NEW ROUND — " .. (source or "unknown"))
     bagFullThisRound = false
+    resetDoneThisRound = false
     latestCoins = 0
     latestMaxCoins = 0
     firedThisRound = {}
@@ -165,11 +181,15 @@ local function goIdle(reason)
     if state ~= STATE.IDLE then log("IDLE — " .. (reason or "")) end
     state = STATE.IDLE
     bagFullThisRound = false
+    resetDoneThisRound = false
     latestCoins = 0
     latestMaxCoins = 0
     firedThisRound = {}
+    resettingStartedAt = 0
+    charAtResetStart = nil
 end
 
+-- Main loop
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -219,10 +239,15 @@ task.spawn(function()
         elseif state == STATE.WAITING then
             if not hasKnife() then goIdle("knife gone while waiting") continue end
 
-            if bagFullThisRound then
-                log(string.format("MAX COINS (%d/%d) — resetting self", latestCoins, latestMaxCoins))
+            local roundAge = tick() - roundStartedAt
+
+            if bagFullThisRound
+                and not resetDoneThisRound
+                and roundAge >= MIN_ROUND_AGE_FOR_RESET then
+                log(string.format("MAX COINS (%d/%d) — resetting self (age %.1fs)",
+                    latestCoins, latestMaxCoins, roundAge))
                 charAtResetStart = player.Character
-                resetCharacter()
+                resetCharacter(roundAge)
                 state = STATE.RESETTING
                 resettingStartedAt = tick()
             else
@@ -242,18 +267,13 @@ task.spawn(function()
             if newChar then goIdle("new character")
             elseif knifeGone then goIdle("knife gone")
             elseif elapsed > RESETTING_TIMEOUT then goIdle("reset timeout")
-            elseif elapsed > 2 then
-                local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-                if hum and hum.Health > 0 then
-                    log("Retrying reset — health still " .. tostring(hum.Health))
-                    resetCharacter()
-                end
             end
             task.wait(0.4)
         end
     end
 end)
 
+-- GiveWeapon
 task.spawn(function()
     local ok, GiveWeapon = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("GiveWeapon", 10)
@@ -264,6 +284,7 @@ task.spawn(function()
     end)
 end)
 
+-- CoinsStarted fallback
 task.spawn(function()
     local ok, CoinsStarted = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("CoinsStarted", 10)
@@ -276,6 +297,7 @@ task.spawn(function()
     end)
 end)
 
+-- CoinCollected
 task.spawn(function()
     local ok, CoinCollected = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("CoinCollected", 10)
@@ -298,6 +320,9 @@ section:AddToggle("Auto-Kill All", function(v)
     autoKillEnabled = v
     if v then
         log("Toggle ON")
+        if state == STATE.RESETTING then
+            goIdle("toggle on — clearing stale resetting")
+        end
         if hasKnife() then startNewRound("toggle on with knife")
         else goIdle("toggle on, no knife") end
         shared.Notify("Assassin enabled", 2)
@@ -324,4 +349,4 @@ section:AddButton("Clear Whitelist", function()
     shared.Notify("Whitelist cleared.", 2)
 end)
 
-shared.Notify("Assassin AFP Loaded", 1)
+shared.Notify("Assassin Kill loaded", 1)
