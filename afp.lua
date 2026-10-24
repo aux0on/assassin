@@ -21,6 +21,9 @@ local maxCoinsReached = false
 local activeKillName = nil
 local targetLabel = nil
 
+local killCap = 0       -- set at round start: #players - 2
+local killCount = 0     -- increments each confirmed kill
+
 local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
 local state = STATE.IDLE
 
@@ -92,23 +95,48 @@ local function rawFire(name)
     ht:FireServer(part)
 end
 
+-- track when a target dies by watching their humanoid health drop to 0
+local function watchForKillConfirm(name)
+    task.spawn(function()
+        local p = Players:FindFirstChild(name)
+        if not p or not p.Character then return end
+        local hum = p.Character:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        hum:GetPropertyChangedSignal("Health"):Connect(function()
+            if hum.Health <= 0 and state == STATE.KILLING then
+                killCount += 1
+                log(string.format("kill confirmed: %s | kills %d/%d", name, killCount, killCap))
+                if killCount >= killCap then
+                    state = STATE.WAITING
+                    log("cap reached — holding last player for max coins")
+                    if maxCoinsReached then
+                        state = STATE.FINAL
+                        local last = getTargetName()
+                        if last then
+                            rawFire(last)
+                        end
+                    end
+                end
+            end
+        end)
+    end)
+end
+
 local function rapidKill(name)
     if activeKillName == name then return end
     activeKillName = name
+    watchForKillConfirm(name)
     log("rapidKill: " .. name)
     task.spawn(function()
         while autoKillEnabled and hasKnife() do
-            -- stop firing if we're in WAITING — protecting last player
             if state == STATE.WAITING then break end
-
+            if state == STATE.IDLE then break end
             local cur = getTargetName()
             if cur ~= name then break end
-
             local p = Players:FindFirstChild(name)
             if not p or not p.Character then break end
             local hum = p.Character:FindFirstChildOfClass("Humanoid")
             if not hum or hum.Health <= 0 then break end
-
             rawFire(name)
             task.wait(0.05)
         end
@@ -122,49 +150,48 @@ local function attemptKill(name, source)
         if not name or name == "" then return end
         if isWhitelisted(name) then return end
         if not hasKnife() then return end
-
-        -- block kill if waiting for max coins
         if state == STATE.WAITING and not maxCoinsReached then
             log("holding last player — waiting for bag full")
             return
         end
-
         if state == STATE.IDLE then state = STATE.KILLING end
 
-        local living = getLivingCount()
-        log(string.format("attemptKill [%s] target=%s living=%d", source, name, living))
+        log(string.format("attemptKill [%s] target=%s kills=%d/%d", source, name, killCount, killCap))
 
-        if state == STATE.KILLING then
-            if living <= 1 then
-                -- only 1 left, protect them until max coins
-                state = STATE.WAITING
-                log("1 left — holding for max coins")
-                if maxCoinsReached then
-                    -- coins already full, kill now
-                    state = STATE.FINAL
-                    rawFire(name)
-                    rapidKill(name)
-                end
-                return
+        -- cap check: if we've already hit the cap, protect last player
+        if state == STATE.KILLING and killCount >= killCap then
+            state = STATE.WAITING
+            log("cap already met — switching to WAITING")
+            if maxCoinsReached then
+                state = STATE.FINAL
+                rawFire(name)
+                rapidKill(name)
             end
-            -- more than 1 alive, kill freely
-            rawFire(name)
-            rapidKill(name)
+            return
+        end
 
-        elseif state == STATE.FINAL then
+        if state == STATE.KILLING or state == STATE.FINAL then
             rawFire(name)
             rapidKill(name)
         end
     end)
 end
 
+local function startRound()
+    -- snapshot player count now: total - self - 1 (last to leave alive)
+    local total = #Players:GetPlayers()
+    killCap = math.max(total - 2, 0)
+    killCount = 0
+    maxCoinsReached = false
+    activeKillName = nil
+    state = STATE.KILLING
+    log(string.format("round start — %d players, kill cap: %d", total, killCap))
+end
+
 local function onKnifeDetected()
     task.spawn(function()
         if not autoKillEnabled then return end
-        state = STATE.KILLING
-        maxCoinsReached = false
-        activeKillName = nil
-        log("knife detected")
+        startRound()
         attemptKill(getTargetName(), "knife")
     end)
 end
@@ -177,7 +204,6 @@ local function onTargetChanged(name)
     end)
 end
 
--- cache label early
 task.spawn(function()
     targetLabel = player.PlayerGui
         :WaitForChild("MainGUI")
@@ -195,7 +221,6 @@ task.spawn(function()
     end)
 end)
 
--- knife watchers
 task.spawn(function()
     local bp = player:WaitForChild("Backpack")
     bp.ChildAdded:Connect(function(item)
@@ -233,7 +258,6 @@ task.spawn(function()
     end
 end)
 
--- round reset watcher
 task.spawn(function()
     while true do
         task.wait(0.4)
@@ -243,11 +267,12 @@ task.spawn(function()
             state = STATE.IDLE
             maxCoinsReached = false
             activeKillName = nil
+            killCount = 0
+            killCap = 0
         end
     end
 end)
 
--- coin tracking
 task.spawn(function()
     local ok, remote = pcall(function()
         return ReplicatedStorage
@@ -292,6 +317,8 @@ section:AddToggle("Auto-Kill All", function(v)
         state = STATE.IDLE
         maxCoinsReached = false
         activeKillName = nil
+        killCount = 0
+        killCap = 0
         shared.Notify(v and "Assassin enabled" or "Assassin disabled", 2)
     end)
 end)
