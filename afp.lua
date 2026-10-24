@@ -24,7 +24,7 @@ local bagFullThisRound = false
 local resetDoneThisRound = false
 local latestCoins = 0
 local latestMaxCoins = 0
-local firedThisRound = {}     -- names we've fired at this round
+local firedThisRound = {}
 local roundStartedAt = 0
 local resettingStartedAt = 0
 local charAtResetStart = nil
@@ -72,7 +72,7 @@ local function getCurrentTargetName()
     local pGui = player:FindFirstChild("PlayerGui")
     if not pGui then return nil end
     local mainGui = pGui:FindFirstChild("MainGUI")
-    if not mainGui then return end nil
+    if not mainGui then return nil end
     local gameFrame = mainGui:FindFirstChild("Game")
     if not gameFrame then return nil end
     local assassinTarget = gameFrame:FindFirstChild("AssassinTarget")
@@ -192,23 +192,18 @@ task.spawn(function()
             if not hasKnife() then goIdle("knife gone mid-round") continue end
 
             local targetName = getCurrentTargetName()
-            log(string.format("(target: %s, fired: %d)",
-                tostring(targetName), #firedThisRound))
+            log(string.format("(target: %s, fired: %d)", tostring(targetName), #firedThisRound))
 
-            -- Case 1: GUI has no target
             if not targetName then
                 task.wait(0.3)
                 continue
             end
 
-            -- Case 2: target is already in our fired set
-            -- This is normal immediately after a kill. Wait for the GUI to advance.
             if firedThisRound[targetName] then
                 task.wait(0.4)
                 continue
             end
 
-            -- Case 3: target is whitelisted — treat as "last one left"
             if isWhitelisted(targetName) then
                 log("Target is whitelisted — WAITING for max coins")
                 state = STATE.WAITING
@@ -216,12 +211,9 @@ task.spawn(function()
                 continue
             end
 
-            -- Count how many other knife-holders remain (best-effort).
-            -- We use PlayerGui as the source of truth: once we've fired at all but one
-            -- target name that existed, we should stop.
-            local allPlayers = Players:GetPlayers()
+            -- Count live knife-holders (best-effort; client may not see other players' knives)
             local liveKnifeHolders = {}
-            for _, p in ipairs(allPlayers) do
+            for _, p in ipairs(Players:GetPlayers()) do
                 if p ~= player and not isWhitelisted(p) then
                     local bp = p:FindFirstChild("Backpack")
                     local ch = p.Character
@@ -233,7 +225,6 @@ task.spawn(function()
                 end
             end
 
-            -- Filter out anyone we've already fired at — they're dead
             local unkilledHolders = {}
             for _, p in ipairs(liveKnifeHolders) do
                 if not firedThisRound[p.Name] then
@@ -251,23 +242,6 @@ task.spawn(function()
                 continue
             end
 
-            -- If we can't count knife-holders reliably (0), fall back to
-            -- "we've seen and killed all names except the current target"
-            if #liveKnifeHolders == 0 and #firedThisRound >= 1 then
-                -- At least one kill already happened and no knife-holders are visible.
-                -- Keep going only if the target is new.
-                if not firedThisRound[targetName] then
-                    log(string.format("Firing at %s (fired so far: %d)", targetName, #firedThisRound))
-                    if killTarget(targetName) then
-                        firedThisRound[targetName] = true
-                        lastSeenTarget = targetName
-                    end
-                    task.wait(KILL_COOLDOWN)
-                end
-                continue
-            end
-
-            -- Normal case: fire at current target
             log(string.format("Firing at %s (knife-holders: %d, unkilled: %d)",
                 targetName, #liveKnifeHolders, #unkilledHolders))
             if killTarget(targetName) then
@@ -289,7 +263,6 @@ task.spawn(function()
                 state = STATE.RESETTING
                 resettingStartedAt = tick()
             else
-                -- Only leave WAITING if a brand-new target name appears that we haven't fired at
                 local targetName = getCurrentTargetName()
                 if targetName and not firedThisRound[targetName]
                     and not isWhitelisted(targetName)
