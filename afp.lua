@@ -11,7 +11,6 @@ local section = afp:AddSection("Assassin")
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 
 while not Players.LocalPlayer do task.wait() end
 local player = Players.LocalPlayer
@@ -79,20 +78,18 @@ local function getTargetName()
 end
 
 local function rawFire(name)
-    task.spawn(function()
-        if not name then return end
-        local knife = getKnife()
-        if not knife then return end
-        local events = knife:FindFirstChild("Events")
-        if not events then return end
-        local ht = events:FindFirstChild("HandleTouched")
-        if not ht then return end
-        local p = Players:FindFirstChild(name)
-        if not p or not p.Character then return end
-        local part = getKillPart(p.Character)
-        if not part then return end
-        ht:FireServer(part)
-    end)
+    if not name then return end
+    local knife = getKnife()
+    if not knife then return end
+    local events = knife:FindFirstChild("Events")
+    if not events then return end
+    local ht = events:FindFirstChild("HandleTouched")
+    if not ht then return end
+    local p = Players:FindFirstChild(name)
+    if not p or not p.Character then return end
+    local part = getKillPart(p.Character)
+    if not part then return end
+    ht:FireServer(part)
 end
 
 local function rapidKill(name)
@@ -101,12 +98,17 @@ local function rapidKill(name)
     log("rapidKill: " .. name)
     task.spawn(function()
         while autoKillEnabled and hasKnife() do
+            -- stop firing if we're in WAITING — protecting last player
+            if state == STATE.WAITING then break end
+
             local cur = getTargetName()
             if cur ~= name then break end
+
             local p = Players:FindFirstChild(name)
             if not p or not p.Character then break end
             local hum = p.Character:FindFirstChildOfClass("Humanoid")
             if not hum or hum.Health <= 0 then break end
+
             rawFire(name)
             task.wait(0.05)
         end
@@ -120,26 +122,39 @@ local function attemptKill(name, source)
         if not name or name == "" then return end
         if isWhitelisted(name) then return end
         if not hasKnife() then return end
-        if state == STATE.WAITING and not maxCoinsReached then return end
 
-        log("fire from " .. source .. ": " .. name)
-
-        rawFire(name)
+        -- block kill if waiting for max coins
+        if state == STATE.WAITING and not maxCoinsReached then
+            log("holding last player — waiting for bag full")
+            return
+        end
 
         if state == STATE.IDLE then state = STATE.KILLING end
 
         local living = getLivingCount()
-        if living <= 1 and state == STATE.KILLING then
-            state = STATE.WAITING
-            log("1 left — waiting for bag")
-            if maxCoinsReached then
-                state = STATE.FINAL
-                rapidKill(name)
-            end
-            return
-        end
+        log(string.format("attemptKill [%s] target=%s living=%d", source, name, living))
 
-        rapidKill(name)
+        if state == STATE.KILLING then
+            if living <= 1 then
+                -- only 1 left, protect them until max coins
+                state = STATE.WAITING
+                log("1 left — holding for max coins")
+                if maxCoinsReached then
+                    -- coins already full, kill now
+                    state = STATE.FINAL
+                    rawFire(name)
+                    rapidKill(name)
+                end
+                return
+            end
+            -- more than 1 alive, kill freely
+            rawFire(name)
+            rapidKill(name)
+
+        elseif state == STATE.FINAL then
+            rawFire(name)
+            rapidKill(name)
+        end
     end)
 end
 
@@ -148,6 +163,7 @@ local function onKnifeDetected()
         if not autoKillEnabled then return end
         state = STATE.KILLING
         maxCoinsReached = false
+        activeKillName = nil
         log("knife detected")
         attemptKill(getTargetName(), "knife")
     end)
@@ -231,7 +247,7 @@ task.spawn(function()
     end
 end)
 
--- coins
+-- coin tracking
 task.spawn(function()
     local ok, remote = pcall(function()
         return ReplicatedStorage
@@ -255,7 +271,7 @@ task.spawn(function()
 
             if max > 0 and current >= max then
                 maxCoinsReached = true
-                log(string.format("bag full (%d/%d)", current, max))
+                log(string.format("bag full (%d/%d) — killing last target", current, max))
 
                 if state == STATE.WAITING then
                     local name = getTargetName()
