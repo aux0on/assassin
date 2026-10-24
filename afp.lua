@@ -24,10 +24,11 @@ local bagFullThisRound = false
 local resetDoneThisRound = false
 local latestCoins = 0
 local latestMaxCoins = 0
-local firedThisRound = {}
+local firedThisRound = {}     -- names we've fired at this round
 local roundStartedAt = 0
 local resettingStartedAt = 0
 local charAtResetStart = nil
+local lastSeenTarget = nil
 
 local KILL_COOLDOWN = 1.0
 local RESETTING_TIMEOUT = 8.0
@@ -42,15 +43,6 @@ local function isWhitelisted(p)
         local plr = Players:FindFirstChild(p)
         return plr and table.find(whitelist, plr.UserId) ~= nil
     end
-    return false
-end
-
-local function hasToolNamed(p, toolName)
-    if not p then return false end
-    local bp = p:FindFirstChild("Backpack")
-    if bp and bp:FindFirstChild(toolName) then return true end
-    local char = p.Character
-    if char and char:FindFirstChild(toolName) then return true end
     return false
 end
 
@@ -76,21 +68,11 @@ local function getKillPart(character)
         or character:FindFirstChild("HumanoidRootPart")
 end
 
-local function getLivingOthers()
-    local list = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and not isWhitelisted(p) and hasToolNamed(p, "Knife") then
-            table.insert(list, p)
-        end
-    end
-    return list
-end
-
 local function getCurrentTargetName()
     local pGui = player:FindFirstChild("PlayerGui")
     if not pGui then return nil end
     local mainGui = pGui:FindFirstChild("MainGUI")
-    if not mainGui then return nil end
+    if not mainGui then return end nil
     local gameFrame = mainGui:FindFirstChild("Game")
     if not gameFrame then return nil end
     local assassinTarget = gameFrame:FindFirstChild("AssassinTarget")
@@ -98,7 +80,9 @@ local function getCurrentTargetName()
     local targetNameObj = assassinTarget:FindFirstChild("TargetName")
     if targetNameObj and (targetNameObj:IsA("TextLabel") or targetNameObj:IsA("TextBox")) then
         local text = targetNameObj.Text
-        if text and text ~= "" and text ~= "Nikilis" then return text end
+        if text and text ~= "" and text ~= "Nikilis" then
+            return text
+        end
     end
     return nil
 end
@@ -122,7 +106,6 @@ local function killTarget(name)
     return false
 end
 
--- Hard-guarded reset: only called from WAITING + bagFull path.
 local function resetCharacter(roundAge)
     if not autoKillEnabled then return end
     if state ~= STATE.WAITING then return end
@@ -171,6 +154,7 @@ local function startNewRound(source)
     latestCoins = 0
     latestMaxCoins = 0
     firedThisRound = {}
+    lastSeenTarget = nil
     roundStartedAt = tick()
     resettingStartedAt = 0
     charAtResetStart = nil
@@ -185,11 +169,11 @@ local function goIdle(reason)
     latestCoins = 0
     latestMaxCoins = 0
     firedThisRound = {}
+    lastSeenTarget = nil
     resettingStartedAt = 0
     charAtResetStart = nil
 end
 
--- Main loop
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -207,43 +191,97 @@ task.spawn(function()
         if state == STATE.KILLING then
             if not hasKnife() then goIdle("knife gone mid-round") continue end
 
-            local others = getLivingOthers()
-            local unkilled = 0
-            for _, p in ipairs(others) do
-                if not firedThisRound[p.Name] then unkilled = unkilled + 1 end
+            local targetName = getCurrentTargetName()
+            log(string.format("(target: %s, fired: %d)",
+                tostring(targetName), #firedThisRound))
+
+            -- Case 1: GUI has no target
+            if not targetName then
+                task.wait(0.3)
+                continue
             end
 
-            log(string.format("(knife-holders: %d, unkilled: %d)", #others, unkilled))
+            -- Case 2: target is already in our fired set
+            -- This is normal immediately after a kill. Wait for the GUI to advance.
+            if firedThisRound[targetName] then
+                task.wait(0.4)
+                continue
+            end
 
-            if #others <= 1 then
-                log(string.format("Only %d knife-holder(s) — WAITING for max coins (%d/%d)",
-                    #others, latestCoins, latestMaxCoins))
+            -- Case 3: target is whitelisted — treat as "last one left"
+            if isWhitelisted(targetName) then
+                log("Target is whitelisted — WAITING for max coins")
                 state = STATE.WAITING
                 task.wait(0.3)
                 continue
             end
 
-            local targetName = getCurrentTargetName()
-            if not targetName then
-                task.wait(0.2)
-            elseif firedThisRound[targetName] then
-                task.wait(0.3)
-            else
-                log(string.format("Firing at %s (knife-holders: %d)", targetName, #others))
-                if killTarget(targetName) then
-                    firedThisRound[targetName] = true
+            -- Count how many other knife-holders remain (best-effort).
+            -- We use PlayerGui as the source of truth: once we've fired at all but one
+            -- target name that existed, we should stop.
+            local allPlayers = Players:GetPlayers()
+            local liveKnifeHolders = {}
+            for _, p in ipairs(allPlayers) do
+                if p ~= player and not isWhitelisted(p) then
+                    local bp = p:FindFirstChild("Backpack")
+                    local ch = p.Character
+                    local holdsKnife = (bp and bp:FindFirstChild("Knife"))
+                        or (ch and ch:FindFirstChild("Knife"))
+                    if holdsKnife then
+                        table.insert(liveKnifeHolders, p)
+                    end
                 end
-                task.wait(KILL_COOLDOWN)
             end
+
+            -- Filter out anyone we've already fired at — they're dead
+            local unkilledHolders = {}
+            for _, p in ipairs(liveKnifeHolders) do
+                if not firedThisRound[p.Name] then
+                    table.insert(unkilledHolders, p)
+                end
+            end
+
+            log(string.format("(knife-holders: %d, unkilled: %d, target: %s)",
+                #liveKnifeHolders, #unkilledHolders, targetName))
+
+            if #liveKnifeHolders > 0 and #unkilledHolders <= 1 then
+                log("Only 1 unkilled knife-holder — WAITING for max coins")
+                state = STATE.WAITING
+                task.wait(0.3)
+                continue
+            end
+
+            -- If we can't count knife-holders reliably (0), fall back to
+            -- "we've seen and killed all names except the current target"
+            if #liveKnifeHolders == 0 and #firedThisRound >= 1 then
+                -- At least one kill already happened and no knife-holders are visible.
+                -- Keep going only if the target is new.
+                if not firedThisRound[targetName] then
+                    log(string.format("Firing at %s (fired so far: %d)", targetName, #firedThisRound))
+                    if killTarget(targetName) then
+                        firedThisRound[targetName] = true
+                        lastSeenTarget = targetName
+                    end
+                    task.wait(KILL_COOLDOWN)
+                end
+                continue
+            end
+
+            -- Normal case: fire at current target
+            log(string.format("Firing at %s (knife-holders: %d, unkilled: %d)",
+                targetName, #liveKnifeHolders, #unkilledHolders))
+            if killTarget(targetName) then
+                firedThisRound[targetName] = true
+                lastSeenTarget = targetName
+            end
+            task.wait(KILL_COOLDOWN)
 
         elseif state == STATE.WAITING then
             if not hasKnife() then goIdle("knife gone while waiting") continue end
 
             local roundAge = tick() - roundStartedAt
 
-            if bagFullThisRound
-                and not resetDoneThisRound
-                and roundAge >= MIN_ROUND_AGE_FOR_RESET then
+            if bagFullThisRound and not resetDoneThisRound and roundAge >= MIN_ROUND_AGE_FOR_RESET then
                 log(string.format("MAX COINS (%d/%d) — resetting self (age %.1fs)",
                     latestCoins, latestMaxCoins, roundAge))
                 charAtResetStart = player.Character
@@ -251,9 +289,12 @@ task.spawn(function()
                 state = STATE.RESETTING
                 resettingStartedAt = tick()
             else
-                local others = getLivingOthers()
-                if #others > 1 then
-                    log(string.format("%d knife-holder(s) — back to KILLING", #others))
+                -- Only leave WAITING if a brand-new target name appears that we haven't fired at
+                local targetName = getCurrentTargetName()
+                if targetName and not firedThisRound[targetName]
+                    and not isWhitelisted(targetName)
+                    and targetName ~= lastSeenTarget then
+                    log("New target appeared: " .. targetName .. " — back to KILLING")
                     state = STATE.KILLING
                 else
                     task.wait(0.4)
@@ -273,7 +314,6 @@ task.spawn(function()
     end
 end)
 
--- GiveWeapon
 task.spawn(function()
     local ok, GiveWeapon = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("GiveWeapon", 10)
@@ -284,7 +324,6 @@ task.spawn(function()
     end)
 end)
 
--- CoinsStarted fallback
 task.spawn(function()
     local ok, CoinsStarted = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("CoinsStarted", 10)
@@ -297,7 +336,6 @@ task.spawn(function()
     end)
 end)
 
--- CoinCollected
 task.spawn(function()
     local ok, CoinCollected = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("CoinCollected", 10)
@@ -320,9 +358,7 @@ section:AddToggle("Auto-Kill All", function(v)
     autoKillEnabled = v
     if v then
         log("Toggle ON")
-        if state == STATE.RESETTING then
-            goIdle("toggle on — clearing stale resetting")
-        end
+        if state == STATE.RESETTING then goIdle("toggle on — clearing stale resetting") end
         if hasKnife() then startNewRound("toggle on with knife")
         else goIdle("toggle on, no knife") end
         shared.Notify("Assassin enabled", 2)
