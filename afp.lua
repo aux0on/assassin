@@ -2,10 +2,8 @@ local shared = odh_shared_plugins
 
 shared.load_from_github_url("/aux0on/CrashHandler/refs/heads/main/Prevention.lua")
 
--- delta fix: poll until game_name resolves
 local _t = tick() + 6
 repeat task.wait(0.15) until shared.game_name ~= nil or tick() > _t
-
 if shared.game_name ~= "Murder Mystery 2" then return end
 
 local afp = shared.CreateTab("Autofarm+", "/aux0on/AFPIcon/refs/heads/main/Untitled163_20260919023714")
@@ -19,17 +17,10 @@ local player = Players.LocalPlayer
 
 local autoKillEnabled = false
 local whitelist = {}
-
-local STATE = {
-    IDLE    = "IDLE",
-    KILLING = "KILLING",
-    WAITING = "WAITING",
-    FINAL   = "FINAL",
-    DONE    = "DONE",
-}
-
-local state = STATE.IDLE
 local maxCoinsReached = false
+
+local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
+local state = STATE.IDLE
 
 local function log(...) print("[Assassin]", ...) end
 
@@ -57,50 +48,47 @@ local function getKnife()
     return nil
 end
 
-local function hasKnife()
-    return getKnife() ~= nil
+local function hasKnife() return getKnife() ~= nil end
+
+local function getKillPart(char)
+    if not char then return nil end
+    return char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("HumanoidRootPart")
 end
 
-local function getKillPart(character)
-    if not character then return nil end
-    return character:FindFirstChild("UpperTorso")
-        or character:FindFirstChild("Torso")
-        or character:FindFirstChild("HumanoidRootPart")
-end
-
-local function getLivingPlayers()
-    local list = {}
+-- count living non-self non-whitelisted players
+local function getLivingCount()
+    local n = 0
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= player and not isWhitelisted(p) and p.Character then
             local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 then
-                table.insert(list, p)
-            end
+            if hum and hum.Health > 0 then n += 1 end
         end
     end
-    return list
+    return n
 end
 
-local function getCurrentTargetName()
-    local pGui = player:FindFirstChild("PlayerGui")
-    if not pGui then return nil end
-    local mainGui = pGui:FindFirstChild("MainGUI")
-    if not mainGui then return nil end
-    local gameFrame = mainGui:FindFirstChild("Game")
-    if not gameFrame then return nil end
-    local assassinTarget = gameFrame:FindFirstChild("AssassinTarget")
-    if not assassinTarget then return nil end
-    local obj = assassinTarget:FindFirstChild("TargetName")
-    if obj and (obj:IsA("TextLabel") or obj:IsA("TextBox")) then
-        local text = obj.Text
-        if text and text ~= "" and text ~= "Nikilis" then
-            return text
-        end
+-- read target name directly via FindFirstChild — no yielding
+local function getTargetName()
+    local gui = player:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    local main = gui:FindFirstChild("MainGUI")
+    if not main then return nil end
+    local game_ = main:FindFirstChild("Game")
+    if not game_ then return nil end
+    local at = game_:FindFirstChild("AssassinTarget")
+    if not at then return nil end
+    local tn = at:FindFirstChild("TargetName")
+    if not tn then return nil end
+    local text = tn.Text
+    if text and text ~= "" and text ~= "Nikilis" then
+        return text
     end
     return nil
 end
 
-local function fireKnifeAt(part)
+local function fireKnife(part)
     local knife = getKnife()
     if not knife then return false end
     local events = knife:FindFirstChild("Events")
@@ -111,142 +99,123 @@ local function fireKnifeAt(part)
     return true
 end
 
-local function killPlayer(p)
-    if not p or isWhitelisted(p) or not p.Character then return false end
+local function killTarget(name)
+    if not name or isWhitelisted(name) then return false end
+    local p = Players:FindFirstChild(name)
+    if not p or not p.Character then return false end
     local part = getKillPart(p.Character)
     local hum = p.Character:FindFirstChildOfClass("Humanoid")
     if part and hum and hum.Health > 0 then
-        return fireKnifeAt(part)
+        return fireKnife(part)
     end
     return false
 end
 
-local function resetRoundState()
-    maxCoinsReached = false
+local function killAllRemaining()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and not isWhitelisted(p) and p.Character then
+            local part = getKillPart(p.Character)
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if part and hum and hum.Health > 0 then
+                fireKnife(part)
+            end
+        end
+    end
 end
 
 -- main loop
 task.spawn(function()
     while true do
-        task.wait(0.1)
+        task.wait(0.12)
 
         if not autoKillEnabled then
-            if state ~= STATE.IDLE then
-                state = STATE.IDLE
-                resetRoundState()
-            end
+            state = STATE.IDLE
+            maxCoinsReached = false
             continue
         end
 
+        -- lost knife mid-round or round ended
         if not hasKnife() then
             if state ~= STATE.IDLE then
-                log("knife gone — waiting for next round")
+                log("knife gone — resetting")
                 state = STATE.IDLE
-                resetRoundState()
+                maxCoinsReached = false
             end
             continue
         end
 
-        -- knife just appeared
         if state == STATE.IDLE then
-            resetRoundState()
-            log("knife detected — starting in 1.5s")
+            -- knife appeared, new round starting
+            log("knife detected — waiting 1.5s before killing")
             task.wait(1.5)
             if not hasKnife() or not autoKillEnabled then continue end
+            maxCoinsReached = false
             state = STATE.KILLING
-            log("KILLING — leaving 1 alive")
+            log("KILLING started")
         end
 
         if state == STATE.KILLING then
-            local targetName = getCurrentTargetName()
+            local living = getLivingCount()
 
-            -- no target name yet — UI hasn't loaded, wait and retry
+            if living <= 1 then
+                -- one left — hold off and wait for max coins
+                log("1 player remaining — waiting for max coins")
+                state = STATE.WAITING
+                continue
+            end
+
+            -- more than 1 alive — kill current assigned target
+            local targetName = getTargetName()
             if not targetName then
-                task.wait(0.2)
+                -- target name not visible yet, retry
+                task.wait(0.15)
                 continue
             end
 
-            local living = getLivingPlayers()
-
-            -- 1 or fewer left — go wait for max coins
-            if #living <= 1 then
-                log("1 target remaining — WAITING for max coins")
-                state = STATE.WAITING
-                continue
-            end
-
-            -- kill anyone who is NOT our current assigned target
-            local killed = false
-            for _, p in ipairs(living) do
-                if p.Name ~= targetName then
-                    if killPlayer(p) then
-                        log("killed " .. p.Name)
-                        killed = true
-                        break
-                    end
-                end
-            end
-
-            -- no non-target found but >1 alive — all remaining must be target chain edge case
-            -- just go to WAITING so we never kill the last one early
-            if not killed then
-                log("no non-target to kill — moving to WAITING")
-                state = STATE.WAITING
-            else
-                task.wait(0.5)
-            end
+            local killed = killTarget(targetName)
+            log((killed and "killed " or "missed ") .. targetName .. " | living: " .. living)
+            task.wait(killed and 0.6 or 0.15)
 
         elseif state == STATE.WAITING then
-            local living = getLivingPlayers()
-
-            if #living == 0 then
-                log("no targets left — DONE")
-                state = STATE.DONE
+            if getLivingCount() == 0 then
+                -- someone else finished the last kill
+                log("no one left — done")
+                state = STATE.IDLE
+                maxCoinsReached = false
                 continue
             end
 
             if maxCoinsReached then
-                log("max coins reached — FINAL kill")
+                log("max coins — killing final player")
                 state = STATE.FINAL
             end
 
         elseif state == STATE.FINAL then
-            local living = getLivingPlayers()
-
-            if #living == 0 then
-                log("last target dead — round complete")
-                state = STATE.DONE
-                continue
-            end
-
-            -- kill every remaining player (should just be 1)
-            for _, p in ipairs(living) do
-                if killPlayer(p) then
-                    log("final kill: " .. p.Name)
-                end
-            end
+            killAllRemaining()
             task.wait(0.5)
-
-        elseif state == STATE.DONE then
-            -- sit here until knife disappears (handled at top)
+            if getLivingCount() == 0 then
+                log("final kill done — round complete")
+                state = STATE.IDLE
+                maxCoinsReached = false
+            end
         end
     end
 end)
 
 -- coin tracking
 task.spawn(function()
-    local ok, CoinCollected = pcall(function()
+    local ok, remote = pcall(function()
         return ReplicatedStorage
             :WaitForChild("Remotes", 10)
             :WaitForChild("Gameplay", 10)
             :WaitForChild("CoinCollected", 10)
     end)
-    if not ok or not CoinCollected then
+    if not ok or not remote then
         log("CoinCollected remote not found")
         return
     end
 
-    CoinCollected.OnClientEvent:Connect(function(a, b, c)
+    remote.OnClientEvent:Connect(function(a, b, c)
         if not autoKillEnabled then return end
         if maxCoinsReached then return end
         if state ~= STATE.KILLING and state ~= STATE.WAITING then return end
@@ -262,7 +231,7 @@ task.spawn(function()
 
         if max > 0 and current >= max then
             maxCoinsReached = true
-            log(string.format("bag full (%d/%d)", current, max))
+            log(string.format("bag full (%d/%d) — final kill armed", current, max))
         end
     end)
 end)
@@ -270,7 +239,7 @@ end)
 section:AddToggle("Auto-Kill All", function(v)
     autoKillEnabled = v
     state = STATE.IDLE
-    resetRoundState()
+    maxCoinsReached = false
     shared.Notify(v and "Assassin enabled" or "Assassin disabled", 2)
 end)
 
