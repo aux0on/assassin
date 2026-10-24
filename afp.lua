@@ -20,10 +20,10 @@ local whitelist = {}
 -- Strict round state machine
 local STATE = {
     IDLE = "IDLE",       -- no knife / disabled
-    KILLING = "KILLING", -- knife detected, killing down to 1
-    WAITING = "WAITING", -- exactly 1 target left, waiting for max coins
+    KILLING = "KILLING", -- killing current active target
+    WAITING = "WAITING", -- 1 target left, waiting for max coins
     FINAL = "FINAL",     -- max coins reached, killing the last one
-    DONE = "DONE",       -- round finished, waiting for knife to vanish
+    DONE = "DONE",       -- round finished
 }
 
 local state = STATE.IDLE
@@ -81,6 +81,7 @@ local function getLivingCount()
     return #getLivingPlayers()
 end
 
+-- FIXED: Robust check for AssassinTarget/TargetName
 local function getCurrentTargetName()
     local pGui = player:FindFirstChild("PlayerGui")
     if not pGui then return nil end
@@ -90,10 +91,19 @@ local function getCurrentTargetName()
     if not gameFrame then return nil end
     local assassinTarget = gameFrame:FindFirstChild("AssassinTarget")
     if not assassinTarget then return nil end
+    
     local targetNameObj = assassinTarget:FindFirstChild("TargetName")
-    if targetNameObj and (targetNameObj:IsA("TextLabel") or targetNameObj:IsA("TextBox")) then
-        local text = targetNameObj.Text
+    if targetNameObj then
+        local text = ""
+        if targetNameObj:IsA("TextLabel") or targetNameObj:IsA("TextBox") then
+            text = targetNameObj.Text
+        elseif targetNameObj:IsA("StringValue") then
+            text = targetNameObj.Value
+        end
+        
         if text and text ~= "" and text ~= "Nikilis" then
+            -- Clean up potential whitespace or formatting
+            text = text:match("^%s*(.-)%s*$")
             return text
         end
     end
@@ -121,20 +131,13 @@ local function killPlayer(p)
     return false
 end
 
-local function killTarget(name)
-    if not name or isWhitelisted(name) then return false end
-    local target = Players:FindFirstChild(name)
-    if not target then return false end
-    return killPlayer(target)
-end
-
 local function killAllRemaining()
     for _, p in ipairs(getLivingPlayers()) do
         killPlayer(p)
     end
 end
 
--- Strict state machine: one path, no overlapping loops
+-- Main state loop adhering strictly to current target order
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -146,9 +149,6 @@ task.spawn(function()
         end
 
         if not hasKnife() then
-            if state ~= STATE.IDLE then
-                print("[Assassin] Knife no longer detected — reset for next round")
-            end
             state = STATE.IDLE
             maxCoinsReached = false
             continue
@@ -157,7 +157,7 @@ task.spawn(function()
         if state == STATE.IDLE then
             state = STATE.KILLING
             maxCoinsReached = false
-            print("[Assassin] Knife detected — killing all but 1")
+            print("[Assassin] Knife detected — starting target hunt")
             task.wait(1.35)
             if not hasKnife() then
                 state = STATE.IDLE
@@ -175,22 +175,19 @@ task.spawn(function()
                 print("[Assassin] 1 target left — waiting for max coins")
             else
                 local targetName = getCurrentTargetName()
-                local livingPlayers = getLivingPlayers()
                 local didKill = false
 
-                -- Strictly avoid the assassin's assigned target while others remain.
-                for _, p in ipairs(livingPlayers) do
-                    if not (targetName and p.Name == targetName) then
-                        if killPlayer(p) then
+                if targetName then
+                    local targetPlayer = Players:FindFirstChild(targetName)
+                    if targetPlayer then
+                        if killPlayer(targetPlayer) then
                             didKill = true
-                            break
+                            print("[Assassin] Successfully attacked current target: " .. targetName)
                         end
                     end
-                end
-
-                -- Fallback only if a non-target could not be killed and >1 remain.
-                if not didKill and living > 1 then
-                    for _, p in ipairs(livingPlayers) do
+                else
+                    -- Fallback if UI label isn't immediately read
+                    for _, p in ipairs(getLivingPlayers()) do
                         if killPlayer(p) then
                             didKill = true
                             break
@@ -203,38 +200,32 @@ task.spawn(function()
         elseif state == STATE.WAITING then
             if getLivingCount() == 0 then
                 state = STATE.DONE
-                print("[Assassin] All targets gone — done")
             elseif maxCoinsReached then
                 state = STATE.FINAL
-                print("[Assassin] Max coins reached — killing the last target")
+                print("[Assassin] Max coins reached — eliminating final target")
             end
         elseif state == STATE.FINAL then
             if getLivingCount() <= 0 then
                 state = STATE.DONE
-                print("[Assassin] Last target eliminated — round complete")
             else
                 killAllRemaining()
                 task.wait(0.5)
             end
         elseif state == STATE.DONE then
-            -- Idle until the knife disappears; reset happens above.
+            -- Waiting for round reset
         end
     end
 end)
 
--- Max coins detection: only arms the FINAL state, never kills directly.
+-- Max coins detector
 task.spawn(function()
     local ok, CoinCollected = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Gameplay"):WaitForChild("CoinCollected", 10)
     end)
-    if not ok or not CoinCollected then
-        shared.Notify("CoinCollected remote missing", 3)
-        return
-    end
+    if not ok or not CoinCollected then return end
 
     CoinCollected.OnClientEvent:Connect(function(a, b, c)
-        if not autoKillEnabled then return end
-        if maxCoinsReached then return end
+        if not autoKillEnabled or maxCoinsReached then return end
         if state ~= STATE.KILLING and state ~= STATE.WAITING then return end
 
         local currentCoins, maxCoins
@@ -258,7 +249,7 @@ section:AddToggle("Auto-Kill All", function(v)
     state = STATE.IDLE
     maxCoinsReached = false
     if v then
-        shared.Notify("Assassin enabled — kill all but 1, final kill at max bag", 2)
+        shared.Notify("Assassin enabled — following target order", 2)
     else
         shared.Notify("Assassin disabled", 2)
     end
@@ -276,4 +267,4 @@ section:AddButton("Clear Whitelist", function()
     shared.Notify("Whitelist cleared.", 2)
 end)
 
-shared.Notify("Assassin Kill loaded", 1)
+shared.Notify("Assassin AFP loaded", 1)
