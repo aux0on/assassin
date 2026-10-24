@@ -23,19 +23,15 @@ local state = STATE.IDLE
 local bagFullThisRound = false
 local latestCoins = 0
 local latestMaxCoins = 0
+local firedThisRound = {}
 local roundStartedAt = 0
 local resettingStartedAt = 0
 local charAtResetStart = nil
-local lastTargetName = nil
 
 local KILL_COOLDOWN = 1.0
-local REPLICATION_TIMEOUT = 4.0
 local RESETTING_TIMEOUT = 8.0
-local NO_TARGET_WARN_AFTER = 5.0
 
-local function log(...)
-    print("[Assassin]", ...)
-end
+local function log(...) print("[Assassin]", ...) end
 
 local function isWhitelisted(p)
     if typeof(p) == "Instance" and p:IsA("Player") then
@@ -44,6 +40,15 @@ local function isWhitelisted(p)
         local plr = Players:FindFirstChild(p)
         return plr and table.find(whitelist, plr.UserId) ~= nil
     end
+    return false
+end
+
+local function hasToolNamed(p, toolName)
+    if not p then return false end
+    local bp = p:FindFirstChild("Backpack")
+    if bp and bp:FindFirstChild(toolName) then return true end
+    local char = p.Character
+    if char and char:FindFirstChild(toolName) then return true end
     return false
 end
 
@@ -60,7 +65,6 @@ local function getKnife()
     end
     return nil
 end
-
 local function hasKnife() return getKnife() ~= nil end
 
 local function getKillPart(character)
@@ -70,20 +74,17 @@ local function getKillPart(character)
         or character:FindFirstChild("HumanoidRootPart")
 end
 
-local function getLivingPlayers()
+-- Assassin mode: alive == has a Knife. Dead players lose the tool.
+local function getLivingOthers()
     local list = {}
     for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and p.Character and not isWhitelisted(p) then
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 then table.insert(list, p) end
+        if p ~= player and not isWhitelisted(p) and hasToolNamed(p, "Knife") then
+            table.insert(list, p)
         end
     end
     return list
 end
 
-local function getLivingCount() return #getLivingPlayers() end
-
--- EXACT copy from your original working script
 local function getCurrentTargetName()
     local pGui = player:FindFirstChild("PlayerGui")
     if not pGui then return nil end
@@ -96,14 +97,11 @@ local function getCurrentTargetName()
     local targetNameObj = assassinTarget:FindFirstChild("TargetName")
     if targetNameObj and (targetNameObj:IsA("TextLabel") or targetNameObj:IsA("TextBox")) then
         local text = targetNameObj.Text
-        if text and text ~= "" and text ~= "Nikilis" then
-            return text
-        end
+        if text and text ~= "" and text ~= "Nikilis" then return text end
     end
     return nil
 end
 
--- EXACT copy from your original working script
 local function killTarget(name)
     if not name or isWhitelisted(name) then return false end
     local knife = getKnife()
@@ -124,7 +122,7 @@ local function killTarget(name)
 end
 
 local function resetCharacter()
-    log("Resetting character")
+    log("Attempting character reset")
     local char = player.Character
     if not char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -136,15 +134,17 @@ local function resetCharacter()
     task.wait(0.15)
     if hum.Parent and hum.Health > 0 then
         pcall(function() hum:TakeDamage(hum.MaxHealth * 10) end)
+        task.wait(0.15)
     end
-    task.wait(0.15)
     if hum.Parent and hum.Health > 0 then
         pcall(function() char:BreakJoints() end)
+        task.wait(0.15)
     end
-    task.wait(0.15)
     if hum.Parent and hum.Health > 0 then
-        -- last resort: destroy the humanoid so char is cleaned up
+        log("WARNING — reset methods failed (health still " .. tostring(hum.Health) .. ")")
         pcall(function() hum:Destroy() end)
+    else
+        log("Character reset — health now " .. tostring(hum and hum.Health or "N/A"))
     end
 end
 
@@ -154,7 +154,7 @@ local function startNewRound(source)
     bagFullThisRound = false
     latestCoins = 0
     latestMaxCoins = 0
-    lastTargetName = nil
+    firedThisRound = {}
     roundStartedAt = tick()
     resettingStartedAt = 0
     charAtResetStart = nil
@@ -162,17 +162,14 @@ local function startNewRound(source)
 end
 
 local function goIdle(reason)
-    if state ~= STATE.IDLE then
-        log("IDLE — " .. (reason or ""))
-    end
+    if state ~= STATE.IDLE then log("IDLE — " .. (reason or "")) end
     state = STATE.IDLE
     bagFullThisRound = false
     latestCoins = 0
     latestMaxCoins = 0
-    lastTargetName = nil
+    firedThisRound = {}
 end
 
--- Main loop
 task.spawn(function()
     while true do
         task.wait(0.1)
@@ -182,111 +179,91 @@ task.spawn(function()
             continue
         end
 
-        -- Auto-start if we're idle with a knife (covers missed GiveWeapon)
         if state == STATE.IDLE then
-            if hasKnife() then
-                startNewRound("knife present in IDLE")
-            end
+            if hasKnife() then startNewRound("knife present in IDLE") end
             continue
         end
 
         if state == STATE.KILLING then
-            if not hasKnife() then
-                goIdle("knife gone mid-round")
-                continue
+            if not hasKnife() then goIdle("knife gone mid-round") continue end
+
+            local others = getLivingOthers()
+            local unkilled = 0
+            for _, p in ipairs(others) do
+                if not firedThisRound[p.Name] then unkilled = unkilled + 1 end
             end
 
-            local living = getLivingCount()
-            if living <= 1 then
-                log(string.format("Only %d living — WAITING for max coins (%d/%d)",
-                    living, latestCoins, latestMaxCoins))
+            log(string.format("(knife-holders: %d, unkilled: %d)", #others, unkilled))
+
+            if #others <= 1 then
+                log(string.format("Only %d knife-holder(s) — WAITING for max coins (%d/%d)",
+                    #others, latestCoins, latestMaxCoins))
                 state = STATE.WAITING
-                lastTargetName = nil
                 task.wait(0.3)
                 continue
             end
 
             local targetName = getCurrentTargetName()
             if not targetName then
-                -- No GUI target — wait. Warn once if it's been too long.
-                if tick() - roundStartedAt > NO_TARGET_WARN_AFTER and not lastTargetName then
-                    log("WARNING — no target name after " .. math.floor(tick() - roundStartedAt) .. "s (GUI path may have changed)")
-                end
                 task.wait(0.2)
+            elseif firedThisRound[targetName] then
+                task.wait(0.3)
             else
-                lastTargetName = targetName
-                local before = living
-                log(string.format("Firing at %s (%d living)", targetName, before))
-                local ok = killTarget(targetName)
-                if ok then
-                    -- Wait for health to replicate before next kill
-                    local timeout = tick() + REPLICATION_TIMEOUT
-                    while tick() < timeout do
-                        task.wait(0.2)
-                        if getLivingCount() < before then break end
-                    end
-                    task.wait(0.3)
-                else
-                    task.wait(0.5)
+                log(string.format("Firing at %s (knife-holders: %d)", targetName, #others))
+                if killTarget(targetName) then
+                    firedThisRound[targetName] = true
                 end
+                task.wait(KILL_COOLDOWN)
             end
 
         elseif state == STATE.WAITING then
-            if not hasKnife() then
-                goIdle("knife gone while waiting")
-                continue
-            end
+            if not hasKnife() then goIdle("knife gone while waiting") continue end
 
-            local living = getLivingCount()
-            if living > 1 then
-                log(string.format("%d living — back to KILLING", living))
-                state = STATE.KILLING
-            elseif bagFullThisRound then
+            if bagFullThisRound then
                 log(string.format("MAX COINS (%d/%d) — resetting self", latestCoins, latestMaxCoins))
                 charAtResetStart = player.Character
                 resetCharacter()
                 state = STATE.RESETTING
                 resettingStartedAt = tick()
             else
-                task.wait(0.4)
+                local others = getLivingOthers()
+                if #others > 1 then
+                    log(string.format("%d knife-holder(s) — back to KILLING", #others))
+                    state = STATE.KILLING
+                else
+                    task.wait(0.4)
+                end
             end
 
         elseif state == STATE.RESETTING then
+            local elapsed = tick() - resettingStartedAt
             local newChar = player.Character ~= charAtResetStart
             local knifeGone = not hasKnife()
-            local timedOut = tick() - resettingStartedAt > RESETTING_TIMEOUT
-
-            if newChar or knifeGone or timedOut then
-                goIdle(timedOut and "reset timeout" or (newChar and "new character" or "knife gone"))
-            elseif tick() - resettingStartedAt > 2 then
-                local char = player.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if newChar then goIdle("new character")
+            elseif knifeGone then goIdle("knife gone")
+            elseif elapsed > RESETTING_TIMEOUT then goIdle("reset timeout")
+            elseif elapsed > 2 then
+                local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
                 if hum and hum.Health > 0 then
-                    resetCharacter()  -- retry
+                    log("Retrying reset — health still " .. tostring(hum.Health))
+                    resetCharacter()
                 end
             end
-            task.wait(0.3)
+            task.wait(0.4)
         end
     end
 end)
 
--- GiveWeapon — primary round-start signal
 task.spawn(function()
     local ok, GiveWeapon = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("GiveWeapon", 10)
     end)
-    if not ok or not GiveWeapon then
-        log("GiveWeapon remote NOT FOUND — falling back to knife presence only")
-        return
-    end
+    if not ok or not GiveWeapon then log("GiveWeapon remote NOT FOUND") return end
     GiveWeapon.OnClientEvent:Connect(function(weaponName)
-        if weaponName == "Knife" then
-            startNewRound("GiveWeapon Knife")
-        end
+        if weaponName == "Knife" then startNewRound("GiveWeapon Knife") end
     end)
 end)
 
--- CoinsStarted — soft fallback
 task.spawn(function()
     local ok, CoinsStarted = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("CoinsStarted", 10)
@@ -299,24 +276,17 @@ task.spawn(function()
     end)
 end)
 
--- CoinCollected — exact arg order confirmed by you: (currencyId, current, max, extra)
 task.spawn(function()
     local ok, CoinCollected = pcall(function()
         return ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("Gameplay", 10):WaitForChild("CoinCollected", 10)
     end)
-    if not ok or not CoinCollected then
-        log("CoinCollected remote NOT FOUND")
-        return
-    end
-    CoinCollected.OnClientEvent:Connect(function(currencyId, currentCoins, maxCoins, extra)
-        -- Only accept during an active round
+    if not ok or not CoinCollected then log("CoinCollected remote NOT FOUND") return end
+    CoinCollected.OnClientEvent:Connect(function(_currencyId, currentCoins, maxCoins, _extra)
         if state ~= STATE.KILLING and state ~= STATE.WAITING then return end
         if type(currentCoins) ~= "number" or type(maxCoins) ~= "number" then return end
         if maxCoins <= 0 then return end
-
         latestCoins = currentCoins
         latestMaxCoins = maxCoins
-
         if currentCoins >= maxCoins and not bagFullThisRound then
             bagFullThisRound = true
             log(string.format("BAG FULL (%d/%d)", currentCoins, maxCoins))
@@ -328,16 +298,18 @@ section:AddToggle("Auto-Kill All", function(v)
     autoKillEnabled = v
     if v then
         log("Toggle ON")
-        if hasKnife() then
-            startNewRound("toggle on with knife")
-        else
-            goIdle("toggle on, no knife yet")
-        end
+        if hasKnife() then startNewRound("toggle on with knife")
+        else goIdle("toggle on, no knife") end
         shared.Notify("Assassin enabled", 2)
     else
         goIdle("toggle")
         shared.Notify("Assassin disabled", 2)
     end
+end)
+
+section:AddButton("Force Reset Round", function()
+    goIdle("manual force reset")
+    shared.Notify("Round state cleared.", 2)
 end)
 
 section:AddPlayerDropdown("Whitelist Player", function(p)
@@ -352,5 +324,4 @@ section:AddButton("Clear Whitelist", function()
     shared.Notify("Whitelist cleared.", 2)
 end)
 
-log("Loaded")
-shared.Notify("Assassin Kill loaded", 1)
+shared.Notify("Assassin AFP Loaded", 1)
