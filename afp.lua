@@ -18,6 +18,7 @@ local player = Players.LocalPlayer
 local autoKillEnabled = false
 local whitelist = {}
 local maxCoinsReached = false
+local killing = false -- prevents overlapping kill loops
 
 local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
 local state = STATE.IDLE
@@ -57,7 +58,6 @@ local function getKillPart(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
--- count living non-self non-whitelisted players
 local function getLivingCount()
     local n = 0
     for _, p in ipairs(Players:GetPlayers()) do
@@ -67,25 +67,6 @@ local function getLivingCount()
         end
     end
     return n
-end
-
--- read target name directly via FindFirstChild — no yielding
-local function getTargetName()
-    local gui = player:FindFirstChild("PlayerGui")
-    if not gui then return nil end
-    local main = gui:FindFirstChild("MainGUI")
-    if not main then return nil end
-    local game_ = main:FindFirstChild("Game")
-    if not game_ then return nil end
-    local at = game_:FindFirstChild("AssassinTarget")
-    if not at then return nil end
-    local tn = at:FindFirstChild("TargetName")
-    if not tn then return nil end
-    local text = tn.Text
-    if text and text ~= "" and text ~= "Nikilis" then
-        return text
-    end
-    return nil
 end
 
 local function fireKnife(part)
@@ -99,8 +80,9 @@ local function fireKnife(part)
     return true
 end
 
-local function killTarget(name)
-    if not name or isWhitelisted(name) then return false end
+local function killByName(name)
+    if not name or name == "" or name == "Nikilis" then return false end
+    if isWhitelisted(name) then return false end
     local p = Players:FindFirstChild(name)
     if not p or not p.Character then return false end
     local part = getKillPart(p.Character)
@@ -111,92 +93,173 @@ local function killTarget(name)
     return false
 end
 
-local function killAllRemaining()
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and not isWhitelisted(p) and p.Character then
-            local part = getKillPart(p.Character)
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if part and hum and hum.Health > 0 then
-                fireKnife(part)
-            end
+local function getTargetLabel()
+    local gui = player:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    local main = gui:FindFirstChild("MainGUI")
+    if not main then return nil end
+    local game_ = main:FindFirstChild("Game")
+    if not game_ then return nil end
+    local at = game_:FindFirstChild("AssassinTarget")
+    if not at then return nil end
+    return at:FindFirstChild("TargetName")
+end
+
+local function getTargetName()
+    local label = getTargetLabel()
+    if not label then return nil end
+    local text = label.Text
+    if text and text ~= "" and text ~= "Nikilis" then return text end
+    return nil
+end
+
+-- spam fire at a specific target until they die or target changes
+local function rapidKill(name)
+    if not name then return end
+    log("rapid kill: " .. name)
+    local attempts = 0
+    while autoKillEnabled and hasKnife() do
+        -- target changed means they died, stop this loop
+        local current = getTargetName()
+        if current ~= name then
+            log("target changed — " .. name .. " is dead")
+            break
         end
+        local p = Players:FindFirstChild(name)
+        if not p or not p.Character then break end
+        local hum = p.Character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then break end
+        local part = getKillPart(p.Character)
+        if part then
+            fireKnife(part)
+            attempts += 1
+        end
+        task.wait(0.05) -- fire every 50ms — fast enough to beat other exploiters
+    end
+    log("rapidKill done after " .. attempts .. " attempts")
+end
+
+-- main kill logic, called on target change or knife detect
+local function onTarget(name)
+    if not autoKillEnabled then return end
+    if not name or name == "" or name == "Nikilis" then return end
+    if not hasKnife() then return end
+    if killing then return end -- already in a kill loop
+
+    local living = getLivingCount()
+    log(string.format("onTarget: %s | living: %d | state: %s | coins: %s",
+        name, living, state, tostring(maxCoinsReached)))
+
+    if state == STATE.IDLE then
+        state = STATE.KILLING
+    end
+
+    if state == STATE.KILLING then
+        if living <= 1 then
+            log("1 left — waiting for max coins")
+            state = STATE.WAITING
+            if maxCoinsReached then
+                state = STATE.FINAL
+                task.spawn(function()
+                    killing = true
+                    rapidKill(name)
+                    killing = false
+                    state = STATE.IDLE
+                    maxCoinsReached = false
+                end)
+            end
+            return
+        end
+
+        task.spawn(function()
+            killing = true
+            rapidKill(name)
+            killing = false
+        end)
+
+    elseif state == STATE.WAITING then
+        if maxCoinsReached then
+            log("coins full — final kill: " .. name)
+            state = STATE.FINAL
+            task.spawn(function()
+                killing = true
+                rapidKill(name)
+                killing = false
+                state = STATE.IDLE
+                maxCoinsReached = false
+            end)
+        end
+
+    elseif state == STATE.FINAL then
+        task.spawn(function()
+            killing = true
+            rapidKill(name)
+            killing = false
+            state = STATE.IDLE
+            maxCoinsReached = false
+        end)
     end
 end
 
--- main loop
+-- watch target label for changes
+task.spawn(function()
+    local label = player.PlayerGui
+        :WaitForChild("MainGUI")
+        :WaitForChild("Game")
+        :WaitForChild("AssassinTarget")
+        :WaitForChild("TargetName")
+
+    log("TargetName label found")
+
+    if label.Text ~= "" then
+        onTarget(label.Text)
+    end
+
+    label:GetPropertyChangedSignal("Text"):Connect(function()
+        onTarget(label.Text)
+    end)
+end)
+
+-- knife detection — fires the moment knife lands in backpack or character
+local function onKnifeAdded(item)
+    if item.Name ~= "Knife" then return end
+    if not autoKillEnabled then return end
+    log("knife detected instantly")
+    state = STATE.KILLING
+    maxCoinsReached = false
+    -- immediately attempt current target
+    local name = getTargetName()
+    if name then
+        onTarget(name)
+    end
+end
+
+task.spawn(function()
+    -- watch backpack
+    local bp = player:WaitForChild("Backpack")
+    bp.ChildAdded:Connect(onKnifeAdded)
+
+    -- watch character (knife moves to char when equipped)
+    local function watchChar(char)
+        if not char then return end
+        char.ChildAdded:Connect(onKnifeAdded)
+    end
+
+    watchChar(player.Character)
+    player.CharacterAdded:Connect(watchChar)
+end)
+
+-- knife watcher — resets between rounds
 task.spawn(function()
     while true do
-        task.wait(0.12)
-
-        if not autoKillEnabled then
-            state = STATE.IDLE
-            maxCoinsReached = false
-            continue
-        end
-
-        -- lost knife mid-round or round ended
+        task.wait(0.5)
+        if not autoKillEnabled then continue end
         if not hasKnife() then
             if state ~= STATE.IDLE then
-                log("knife gone — resetting")
+                log("knife gone — round over")
                 state = STATE.IDLE
                 maxCoinsReached = false
-            end
-            continue
-        end
-
-        if state == STATE.IDLE then
-            -- knife appeared, new round starting
-            log("knife detected — waiting 1.5s before killing")
-            task.wait(1.5)
-            if not hasKnife() or not autoKillEnabled then continue end
-            maxCoinsReached = false
-            state = STATE.KILLING
-            log("KILLING started")
-        end
-
-        if state == STATE.KILLING then
-            local living = getLivingCount()
-
-            if living <= 1 then
-                -- one left — hold off and wait for max coins
-                log("1 player remaining — waiting for max coins")
-                state = STATE.WAITING
-                continue
-            end
-
-            -- more than 1 alive — kill current assigned target
-            local targetName = getTargetName()
-            if not targetName then
-                -- target name not visible yet, retry
-                task.wait(0.15)
-                continue
-            end
-
-            local killed = killTarget(targetName)
-            log((killed and "killed " or "missed ") .. targetName .. " | living: " .. living)
-            task.wait(killed and 0.6 or 0.15)
-
-        elseif state == STATE.WAITING then
-            if getLivingCount() == 0 then
-                -- someone else finished the last kill
-                log("no one left — done")
-                state = STATE.IDLE
-                maxCoinsReached = false
-                continue
-            end
-
-            if maxCoinsReached then
-                log("max coins — killing final player")
-                state = STATE.FINAL
-            end
-
-        elseif state == STATE.FINAL then
-            killAllRemaining()
-            task.wait(0.5)
-            if getLivingCount() == 0 then
-                log("final kill done — round complete")
-                state = STATE.IDLE
-                maxCoinsReached = false
+                killing = false
             end
         end
     end
@@ -218,7 +281,6 @@ task.spawn(function()
     remote.OnClientEvent:Connect(function(a, b, c)
         if not autoKillEnabled then return end
         if maxCoinsReached then return end
-        if state ~= STATE.KILLING and state ~= STATE.WAITING then return end
 
         local current, max
         if typeof(b) == "number" and typeof(c) == "number" then
@@ -231,7 +293,22 @@ task.spawn(function()
 
         if max > 0 and current >= max then
             maxCoinsReached = true
-            log(string.format("bag full (%d/%d) — final kill armed", current, max))
+            log(string.format("bag full (%d/%d)", current, max))
+
+            if state == STATE.WAITING then
+                local name = getTargetName()
+                if name then
+                    log("firing final kill: " .. name)
+                    state = STATE.FINAL
+                    task.spawn(function()
+                        killing = true
+                        rapidKill(name)
+                        killing = false
+                        state = STATE.IDLE
+                        maxCoinsReached = false
+                    end)
+                end
+            end
         end
     end)
 end)
@@ -240,6 +317,7 @@ section:AddToggle("Auto-Kill All", function(v)
     autoKillEnabled = v
     state = STATE.IDLE
     maxCoinsReached = false
+    killing = false
     shared.Notify(v and "Assassin enabled" or "Assassin disabled", 2)
 end)
 
