@@ -62,12 +62,25 @@ local function getKillPart(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
+-- only counts living players within 500 studs — ignores late joiners who haven't loaded in
 local function getLivingCount()
+    local myChar = player.Character
+    if not myChar then return 0 end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return 0 end
     local n = 0
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= player and not isWhitelisted(p) and p.Character then
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 then n += 1 end
+            local pRoot = p.Character:FindFirstChild("HumanoidRootPart")
+            if pRoot then
+                local dist = (pRoot.Position - myRoot.Position).Magnitude
+                if dist <= 500 then
+                    local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health > 0 then
+                        n += 1
+                    end
+                end
+            end
         end
     end
     return n
@@ -108,21 +121,19 @@ local function rapidKill(name, myRoundId)
             if myRoundId ~= roundId then break end
             if state == STATE.IDLE then break end
 
-            -- hard block: never fire at last player unless coins met
+            -- sitting in WAITING — poll until coins met then transition
             if state == STATE.WAITING then
                 if not coinThresholdMet() then
                     task.wait(0.1)
                     continue
                 end
-                -- coins met while we were waiting — transition to final
                 state = STATE.FINAL
-                log("coins met in rapidKill loop — transitioning to FINAL")
+                log("coins met inside rapidKill — FINAL")
             end
 
-            -- stop if only 1 left and coins not met
+            -- hard block: 1 or fewer nearby and coins not met
             if getLivingCount() <= 1 and not coinThresholdMet() then
                 state = STATE.WAITING
-                log("1 left, coins not met — holding")
                 task.wait(0.1)
                 continue
             end
@@ -147,16 +158,17 @@ local function attemptKill(name, source)
         if isWhitelisted(name) then return end
         if not hasKnife() then return end
 
-        -- absolute guard: never kill last player without 50 coins
-        if getLivingCount() <= 1 and not coinThresholdMet() then
+        local living = getLivingCount()
+
+        -- absolute guard — never fire at last nearby player without coins
+        if living <= 1 and not coinThresholdMet() then
             if state == STATE.KILLING then
                 state = STATE.WAITING
-                log("1 left, coins not met — holding in attemptKill")
+                log("1 nearby, coins not met — WAITING (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
             end
             return
         end
 
-        -- already waiting and coins still not met
         if state == STATE.WAITING and not coinThresholdMet() then
             log("still waiting for coins (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
             return
@@ -164,14 +176,13 @@ local function attemptKill(name, source)
 
         if state == STATE.IDLE then state = STATE.KILLING end
 
-        log(string.format("[%s] target=%s living=%d coins=%d",
-            source, name, getLivingCount(), coinsThisRound))
+        log(string.format("[%s] target=%s nearby=%d coins=%d",
+            source, name, living, coinsThisRound))
 
         if state == STATE.KILLING then
-            -- re-check living after state set
-            if getLivingCount() <= 1 then
+            if living <= 1 then
                 state = STATE.WAITING
-                log("1 left — waiting for " .. COIN_THRESHOLD .. " coins")
+                log("1 nearby — waiting for coins")
                 if coinThresholdMet() then
                     state = STATE.FINAL
                     rawFire(name)
@@ -204,7 +215,7 @@ local function startRound()
     coinsThisRound = 0
     activeKillName = nil
     state = STATE.KILLING
-    log(string.format("round start — living=%d (roundId=%d)", getLivingCount(), roundId))
+    log(string.format("round start — nearby=%d (roundId=%d)", getLivingCount(), roundId))
 end
 
 local function onKnifeDetected()
@@ -277,7 +288,6 @@ task.spawn(function()
     end
 end)
 
--- knife gone = round over
 task.spawn(function()
     while true do
         task.wait(0.4)
@@ -288,7 +298,6 @@ task.spawn(function()
     end
 end)
 
--- coin tracking — just accumulate, no max needed
 task.spawn(function()
     local ok, remote = pcall(function()
         return ReplicatedStorage
@@ -312,11 +321,11 @@ task.spawn(function()
             coinsThisRound = current
             log(string.format("coins: %d/%d", coinsThisRound, COIN_THRESHOLD))
 
-            -- crossed threshold while in WAITING — fire final kill immediately
+            -- crossed threshold while holding last player — fire immediately
             if coinThresholdMet() and state == STATE.WAITING then
                 local name = getTargetName()
                 if name then
-                    log("threshold crossed — killing last target: " .. name)
+                    log("threshold crossed — killing last: " .. name)
                     state = STATE.FINAL
                     rawFire(name)
                     rapidKill(name, roundId)
