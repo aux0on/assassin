@@ -20,11 +20,8 @@ local whitelist = {}
 local maxCoinsReached = false
 local activeKillName = nil
 local targetLabel = nil
-
-local killCap = 0
-local killCount = 0
-local roundId = 0       -- increments each round, invalidates old callbacks
-local roundStarted = false  -- prevents startRound firing twice
+local roundId = 0
+local roundStarted = false
 
 local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
 local state = STATE.IDLE
@@ -64,6 +61,7 @@ local function getKillPart(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
+-- only counts living players excluding self and whitelisted
 local function getLivingCount()
     local n = 0
     for _, p in ipairs(Players:GetPlayers()) do
@@ -97,46 +95,34 @@ local function rawFire(name)
     ht:FireServer(part)
 end
 
--- each call tags itself with current roundId — stale connections self-discard
-local function watchForKillConfirm(name, myRoundId)
+local function shouldStopKilling()
+    -- stop if only 1 or fewer non-whitelisted players alive
+    return getLivingCount() <= 1
+end
+
+local function rapidKill(name, myRoundId)
+    if activeKillName == name then return end
+    activeKillName = name
+    log("rapidKill: " .. name)
     task.spawn(function()
-        local p = Players:FindFirstChild(name)
-        if not p or not p.Character then return end
-        local hum = p.Character:FindFirstChildOfClass("Humanoid")
-        if not hum then return end
-        local conn
-        conn = hum:GetPropertyChangedSignal("Health"):Connect(function()
-            -- discard if this belongs to a previous round
-            if myRoundId ~= roundId then conn:Disconnect() return end
-            if hum.Health <= 0 and state == STATE.KILLING then
-                conn:Disconnect()
-                killCount += 1
-                log(string.format("kill confirmed: %s | %d/%d", name, killCount, killCap))
-                if killCount >= killCap then
+        while autoKillEnabled and hasKnife() do
+            if myRoundId ~= roundId then break end
+            if state == STATE.WAITING or state == STATE.IDLE then break end
+
+            -- live check every iteration — stop the instant 1 player remains
+            if shouldStopKilling() then
+                if state == STATE.KILLING then
                     state = STATE.WAITING
-                    log("cap reached — holding last player")
+                    log("1 left — waiting for bag full")
                     if maxCoinsReached then
                         state = STATE.FINAL
                         local last = getTargetName()
                         if last then rawFire(last) end
                     end
                 end
+                break
             end
-        end)
-    end)
-end
 
-local function rapidKill(name)
-    if activeKillName == name then return end
-    activeKillName = name
-    local myRoundId = roundId
-    watchForKillConfirm(name, myRoundId)
-    log("rapidKill: " .. name)
-    task.spawn(function()
-        while autoKillEnabled and hasKnife() do
-            -- stale round or protected state — stop
-            if myRoundId ~= roundId then break end
-            if state == STATE.WAITING or state == STATE.IDLE then break end
             local cur = getTargetName()
             if cur ~= name then break end
             local p = Players:FindFirstChild(name)
@@ -162,39 +148,25 @@ local function attemptKill(name, source)
         end
         if state == STATE.IDLE then state = STATE.KILLING end
 
-        log(string.format("[%s] target=%s kills=%d/%d", source, name, killCount, killCap))
-
-        if state == STATE.KILLING then
-            if killCount >= killCap then
-                state = STATE.WAITING
-                log("cap met on attemptKill — WAITING")
-                if maxCoinsReached then
-                    state = STATE.FINAL
-                    rawFire(name)
-                    rapidKill(name)
-                end
-                return
+        -- live check before doing anything
+        if shouldStopKilling() and state == STATE.KILLING then
+            state = STATE.WAITING
+            log("1 left on attemptKill — WAITING")
+            if maxCoinsReached then
+                state = STATE.FINAL
+                rawFire(name)
+                rapidKill(name, roundId)
             end
-            rawFire(name)
-            rapidKill(name)
+            return
+        end
 
-        elseif state == STATE.FINAL then
+        log(string.format("[%s] target=%s living=%d", source, name, getLivingCount()))
+
+        if state == STATE.KILLING or state == STATE.FINAL then
             rawFire(name)
-            rapidKill(name)
+            rapidKill(name, roundId)
         end
     end)
-end
-
-local function startRound()
-    if roundStarted then return end  -- already started this round
-    roundStarted = true
-    roundId += 1  -- invalidates all previous watchForKillConfirm and rapidKill loops
-    killCap = math.max(#Players:GetPlayers() - 2, 0)
-    killCount = 0
-    maxCoinsReached = false
-    activeKillName = nil
-    state = STATE.KILLING
-    log(string.format("round start — cap=%d (roundId=%d)", killCap, roundId))
 end
 
 local function resetRound()
@@ -202,9 +174,17 @@ local function resetRound()
     state = STATE.IDLE
     maxCoinsReached = false
     activeKillName = nil
-    killCount = 0
-    killCap = 0
     log("round reset")
+end
+
+local function startRound()
+    if roundStarted then return end
+    roundStarted = true
+    roundId += 1
+    maxCoinsReached = false
+    activeKillName = nil
+    state = STATE.KILLING
+    log(string.format("round start — living=%d (roundId=%d)", getLivingCount(), roundId))
 end
 
 local function onKnifeDetected()
@@ -277,7 +257,6 @@ task.spawn(function()
     end
 end)
 
--- knife gone = round over, full reset
 task.spawn(function()
     while true do
         task.wait(0.4)
@@ -317,7 +296,7 @@ task.spawn(function()
                     if name then
                         state = STATE.FINAL
                         rawFire(name)
-                        rapidKill(name)
+                        rapidKill(name, roundId)
                     end
                 end
             end
