@@ -24,6 +24,11 @@ local targetLabel = nil
 local roundId = 0
 local roundStarted = false
 
+-- kill cap from RoundStart remote
+local killCap = 0
+local killCount = 0
+local prevTarget = nil  -- tracks previous target to confirm kills via name change
+
 local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
 local state = STATE.IDLE
 
@@ -62,30 +67,6 @@ local function getKillPart(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
--- only counts living players within 500 studs — ignores late joiners who haven't loaded in
-local function getLivingCount()
-    local myChar = player.Character
-    if not myChar then return 0 end
-    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return 0 end
-    local n = 0
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and not isWhitelisted(p) and p.Character then
-            local pRoot = p.Character:FindFirstChild("HumanoidRootPart")
-            if pRoot then
-                local dist = (pRoot.Position - myRoot.Position).Magnitude
-                if dist <= 500 then
-                    local hum = p.Character:FindFirstChildOfClass("Humanoid")
-                    if hum and hum.Health > 0 then
-                        n += 1
-                    end
-                end
-            end
-        end
-    end
-    return n
-end
-
 local function getTargetName()
     if not targetLabel then return nil end
     local text = targetLabel.Text
@@ -95,6 +76,10 @@ end
 
 local function coinThresholdMet()
     return coinsThisRound >= COIN_THRESHOLD
+end
+
+local function capMet()
+    return killCap > 0 and killCount >= killCap
 end
 
 local function rawFire(name)
@@ -121,18 +106,17 @@ local function rapidKill(name, myRoundId)
             if myRoundId ~= roundId then break end
             if state == STATE.IDLE then break end
 
-            -- sitting in WAITING — poll until coins met then transition
             if state == STATE.WAITING then
                 if not coinThresholdMet() then
                     task.wait(0.1)
                     continue
                 end
                 state = STATE.FINAL
-                log("coins met inside rapidKill — FINAL")
+                log("coins met in loop — FINAL")
             end
 
-            -- hard block: 1 or fewer nearby and coins not met
-            if getLivingCount() <= 1 and not coinThresholdMet() then
+            -- hard block: cap met and coins not met
+            if capMet() and not coinThresholdMet() then
                 state = STATE.WAITING
                 task.wait(0.1)
                 continue
@@ -158,31 +142,29 @@ local function attemptKill(name, source)
         if isWhitelisted(name) then return end
         if not hasKnife() then return end
 
-        local living = getLivingCount()
-
-        -- absolute guard — never fire at last nearby player without coins
-        if living <= 1 and not coinThresholdMet() then
+        -- absolute guard: cap met and coins not met = protect last player
+        if capMet() and not coinThresholdMet() then
             if state == STATE.KILLING then
                 state = STATE.WAITING
-                log("1 nearby, coins not met — WAITING (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
+                log("cap met, coins not met — protecting last player")
             end
             return
         end
 
         if state == STATE.WAITING and not coinThresholdMet() then
-            log("still waiting for coins (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
+            log("waiting for coins (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
             return
         end
 
         if state == STATE.IDLE then state = STATE.KILLING end
 
-        log(string.format("[%s] target=%s nearby=%d coins=%d",
-            source, name, living, coinsThisRound))
+        log(string.format("[%s] target=%s kills=%d/%d coins=%d",
+            source, name, killCount, killCap, coinsThisRound))
 
         if state == STATE.KILLING then
-            if living <= 1 then
+            if capMet() then
                 state = STATE.WAITING
-                log("1 nearby — waiting for coins")
+                log("cap met — WAITING for coins")
                 if coinThresholdMet() then
                     state = STATE.FINAL
                     rawFire(name)
@@ -205,6 +187,9 @@ local function resetRound()
     state = STATE.IDLE
     coinsThisRound = 0
     activeKillName = nil
+    killCount = 0
+    killCap = 0
+    prevTarget = nil
     log("round reset")
 end
 
@@ -214,8 +199,10 @@ local function startRound()
     roundId += 1
     coinsThisRound = 0
     activeKillName = nil
+    killCount = 0
+    prevTarget = nil
     state = STATE.KILLING
-    log(string.format("round start — nearby=%d (roundId=%d)", getLivingCount(), roundId))
+    log(string.format("knife detected — roundId=%d killCap=%d", roundId, killCap))
 end
 
 local function onKnifeDetected()
@@ -226,14 +213,59 @@ local function onKnifeDetected()
     end)
 end
 
+-- called when TargetName text changes
 local function onTargetChanged(name)
     task.spawn(function()
         if not autoKillEnabled then return end
         if not hasKnife() then return end
+
+        -- each target change after the first = 1 confirmed kill
+        if prevTarget ~= nil and prevTarget ~= "" and state == STATE.KILLING then
+            killCount += 1
+            log(string.format("kill confirmed (target changed) — %d/%d", killCount, killCap))
+        end
+        prevTarget = name
+
         attemptKill(name, "targetChanged")
     end)
 end
 
+-- RoundStart remote: count alive players to set killCap
+task.spawn(function()
+    local ok, roundStart = pcall(function()
+        return ReplicatedStorage
+            :WaitForChild("Remotes", 10)
+            :WaitForChild("Gameplay", 10)
+            :WaitForChild("RoundStart", 10)
+    end)
+    if not ok or not roundStart then
+        log("RoundStart remote not found")
+        return
+    end
+
+    roundStart.OnClientEvent:Connect(function(_duration, playerData)
+        task.spawn(function()
+            if not autoKillEnabled then return end
+            if type(playerData) ~= "table" then return end
+
+            -- count alive players including self, then subtract 2
+            -- (1 for self, 1 for the last player to leave alive)
+            local aliveCount = 0
+            for _, data in pairs(playerData) do
+                if type(data) == "table" and data.Dead == false then
+                    aliveCount += 1
+                end
+            end
+
+            killCap = math.max(aliveCount - 2, 0)
+            killCount = 0
+            prevTarget = nil
+            log(string.format("RoundStart: %d alive — killCap=%d", aliveCount, killCap))
+        end)
+    end)
+end)
+
+-- watch TargetName label
 task.spawn(function()
     targetLabel = player.PlayerGui
         :WaitForChild("MainGUI")
@@ -244,13 +276,20 @@ task.spawn(function()
     log("label cached")
 
     local cur = getTargetName()
-    if cur then onTargetChanged(cur) end
+    if cur then
+        prevTarget = cur
+        attemptKill(cur, "initial")
+    end
 
     targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
-        onTargetChanged(targetLabel.Text)
+        local name = targetLabel.Text
+        if name and name ~= "" and name ~= "Nikilis" then
+            onTargetChanged(name)
+        end
     end)
 end)
 
+-- knife watchers
 task.spawn(function()
     local bp = player:WaitForChild("Backpack")
     bp.ChildAdded:Connect(function(item)
@@ -288,6 +327,7 @@ task.spawn(function()
     end
 end)
 
+-- round reset watcher
 task.spawn(function()
     while true do
         task.wait(0.4)
@@ -298,6 +338,7 @@ task.spawn(function()
     end
 end)
 
+-- coin tracking
 task.spawn(function()
     local ok, remote = pcall(function()
         return ReplicatedStorage
@@ -321,11 +362,10 @@ task.spawn(function()
             coinsThisRound = current
             log(string.format("coins: %d/%d", coinsThisRound, COIN_THRESHOLD))
 
-            -- crossed threshold while holding last player — fire immediately
             if coinThresholdMet() and state == STATE.WAITING then
                 local name = getTargetName()
                 if name then
-                    log("threshold crossed — killing last: " .. name)
+                    log("50 coins — killing last: " .. name)
                     state = STATE.FINAL
                     rawFire(name)
                     rapidKill(name, roundId)
