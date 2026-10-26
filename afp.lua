@@ -23,11 +23,29 @@ local activeKillName = nil
 local targetLabel = nil
 local roundId = 0
 local roundStarted = false
+local killThreadActive = false
+
+-- // debug toggle — set true only if you need console output \\
+local DEBUG = false
+local function log(...) if DEBUG then print("[Assassin]", ...) end end
 
 local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
 local state = STATE.IDLE
 
-local function log(...) print("[Assassin]", ...) end
+-- // connection tracking — prevents accumulation of dead connections \\
+local connections = {}
+local function trackConnection(conn)
+    table.insert(connections, conn)
+    return conn
+end
+local function disconnectAll()
+    for _, c in ipairs(connections) do
+        if c and c.Connected then
+            c:Disconnect()
+        end
+    end
+    connections = {}
+end
 
 local function isWhitelisted(p)
     if typeof(p) == "Instance" and p:IsA("Player") then
@@ -62,7 +80,6 @@ local function getKillPart(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
--- only counts living players within 500 studs — ignores late joiners who haven't loaded in
 local function getLivingCount()
     local myChar = player.Character
     if not myChar then return 0 end
@@ -114,14 +131,17 @@ end
 
 local function rapidKill(name, myRoundId)
     if activeKillName == name then return end
+    -- // prevent thread stacking — only one kill loop at a time \\
+    if killThreadActive then return end
+    killThreadActive = true
     activeKillName = name
     log("rapidKill: " .. name)
+
     task.spawn(function()
         while autoKillEnabled and hasKnife() do
             if myRoundId ~= roundId then break end
             if state == STATE.IDLE then break end
 
-            -- sitting in WAITING — poll until coins met then transition
             if state == STATE.WAITING then
                 if not coinThresholdMet() then
                     task.wait(0.1)
@@ -131,7 +151,6 @@ local function rapidKill(name, myRoundId)
                 log("coins met inside rapidKill — FINAL")
             end
 
-            -- hard block: 1 or fewer nearby and coins not met
             if getLivingCount() <= 1 and not coinThresholdMet() then
                 state = STATE.WAITING
                 task.wait(0.1)
@@ -147,7 +166,11 @@ local function rapidKill(name, myRoundId)
             rawFire(name)
             task.wait(0.05)
         end
+
+        -- // always clean up both flags \\
+        killThreadActive = false
         if activeKillName == name then activeKillName = nil end
+        log("rapidKill thread ended: " .. name)
     end)
 end
 
@@ -160,7 +183,6 @@ local function attemptKill(name, source)
 
         local living = getLivingCount()
 
-        -- absolute guard — never fire at last nearby player without coins
         if living <= 1 and not coinThresholdMet() then
             if state == STATE.KILLING then
                 state = STATE.WAITING
@@ -205,6 +227,7 @@ local function resetRound()
     state = STATE.IDLE
     coinsThisRound = 0
     activeKillName = nil
+    killThreadActive = false
     log("round reset")
 end
 
@@ -214,6 +237,7 @@ local function startRound()
     roundId += 1
     coinsThisRound = 0
     activeKillName = nil
+    killThreadActive = false
     state = STATE.KILLING
     log(string.format("round start — nearby=%d (roundId=%d)", getLivingCount(), roundId))
 end
@@ -234,6 +258,7 @@ local function onTargetChanged(name)
     end)
 end
 
+-- // target label watcher \\
 task.spawn(function()
     targetLabel = player.PlayerGui
         :WaitForChild("MainGUI")
@@ -246,26 +271,35 @@ task.spawn(function()
     local cur = getTargetName()
     if cur then onTargetChanged(cur) end
 
-    targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
+    trackConnection(targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
         onTargetChanged(targetLabel.Text)
-    end)
+    end))
 end)
 
+-- // knife watcher — one connection per character, old ones disconnected \\
 task.spawn(function()
-    local bp = player:WaitForChild("Backpack")
-    bp.ChildAdded:Connect(function(item)
-        if item.Name == "Knife" then onKnifeDetected() end
-    end)
+    local charConn = nil
 
     local function watchChar(char)
         if not char then return end
-        char.ChildAdded:Connect(function(item)
+        -- // disconnect previous character's connection before making a new one \\
+        if charConn and charConn.Connected then
+            charConn:Disconnect()
+        end
+        charConn = char.ChildAdded:Connect(function(item)
             if item.Name == "Knife" then onKnifeDetected() end
         end)
     end
 
+    local bp = player:WaitForChild("Backpack")
+    trackConnection(bp.ChildAdded:Connect(function(item)
+        if item.Name == "Knife" then onKnifeDetected() end
+    end))
+
     watchChar(player.Character)
-    player.CharacterAdded:Connect(watchChar)
+    trackConnection(player.CharacterAdded:Connect(function(char)
+        watchChar(char)
+    end))
 
     local ok, giveWeapon = pcall(function()
         return ReplicatedStorage
@@ -274,7 +308,7 @@ task.spawn(function()
             :WaitForChild("GiveWeapon", 10)
     end)
     if ok and giveWeapon then
-        giveWeapon.OnClientEvent:Connect(function(weaponName)
+        trackConnection(giveWeapon.OnClientEvent:Connect(function(weaponName)
             if weaponName ~= "Knife" then return end
             task.spawn(function()
                 local waited = 0
@@ -284,10 +318,11 @@ task.spawn(function()
                     waited += 0.02
                 end
             end)
-        end)
+        end))
     end
 end)
 
+-- // state watchdog — resets if knife disappears \\
 task.spawn(function()
     while true do
         task.wait(0.4)
@@ -298,6 +333,7 @@ task.spawn(function()
     end
 end)
 
+-- // coin collector \\
 task.spawn(function()
     local ok, remote = pcall(function()
         return ReplicatedStorage
@@ -307,7 +343,7 @@ task.spawn(function()
     end)
     if not ok or not remote then log("CoinCollected remote not found") return end
 
-    remote.OnClientEvent:Connect(function(a, b, c)
+    trackConnection(remote.OnClientEvent:Connect(function(a, b)
         task.spawn(function()
             if not autoKillEnabled then return end
 
@@ -321,7 +357,6 @@ task.spawn(function()
             coinsThisRound = current
             log(string.format("coins: %d/%d", coinsThisRound, COIN_THRESHOLD))
 
-            -- crossed threshold while holding last player — fire immediately
             if coinThresholdMet() and state == STATE.WAITING then
                 local name = getTargetName()
                 if name then
@@ -332,12 +367,17 @@ task.spawn(function()
                 end
             end
         end)
-    end)
+    end))
 end)
 
+-- // ui \\
 section:AddToggle("Auto-Kill All", function(v)
     task.spawn(function()
         autoKillEnabled = v
+        if not v then
+            -- // clean up all connections when disabled to free memory \\
+            disconnectAll()
+        end
         resetRound()
         shared.Notify(v and "Assassin enabled" or "Assassin disabled", 2)
     end)
