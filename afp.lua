@@ -21,8 +21,10 @@ local maxCoinsReached = false
 local activeKillName = nil
 local targetLabel = nil
 
-local killCap = 0       -- set at round start: #players - 2
-local killCount = 0     -- increments each confirmed kill
+local killCap = 0
+local killCount = 0
+local roundId = 0       -- increments each round, invalidates old callbacks
+local roundStarted = false  -- prevents startRound firing twice
 
 local STATE = { IDLE = "IDLE", KILLING = "KILLING", WAITING = "WAITING", FINAL = "FINAL" }
 local state = STATE.IDLE
@@ -95,26 +97,28 @@ local function rawFire(name)
     ht:FireServer(part)
 end
 
--- track when a target dies by watching their humanoid health drop to 0
-local function watchForKillConfirm(name)
+-- each call tags itself with current roundId — stale connections self-discard
+local function watchForKillConfirm(name, myRoundId)
     task.spawn(function()
         local p = Players:FindFirstChild(name)
         if not p or not p.Character then return end
         local hum = p.Character:FindFirstChildOfClass("Humanoid")
         if not hum then return end
-        hum:GetPropertyChangedSignal("Health"):Connect(function()
+        local conn
+        conn = hum:GetPropertyChangedSignal("Health"):Connect(function()
+            -- discard if this belongs to a previous round
+            if myRoundId ~= roundId then conn:Disconnect() return end
             if hum.Health <= 0 and state == STATE.KILLING then
+                conn:Disconnect()
                 killCount += 1
-                log(string.format("kill confirmed: %s | kills %d/%d", name, killCount, killCap))
+                log(string.format("kill confirmed: %s | %d/%d", name, killCount, killCap))
                 if killCount >= killCap then
                     state = STATE.WAITING
-                    log("cap reached — holding last player for max coins")
+                    log("cap reached — holding last player")
                     if maxCoinsReached then
                         state = STATE.FINAL
                         local last = getTargetName()
-                        if last then
-                            rawFire(last)
-                        end
+                        if last then rawFire(last) end
                     end
                 end
             end
@@ -125,12 +129,14 @@ end
 local function rapidKill(name)
     if activeKillName == name then return end
     activeKillName = name
-    watchForKillConfirm(name)
+    local myRoundId = roundId
+    watchForKillConfirm(name, myRoundId)
     log("rapidKill: " .. name)
     task.spawn(function()
         while autoKillEnabled and hasKnife() do
-            if state == STATE.WAITING then break end
-            if state == STATE.IDLE then break end
+            -- stale round or protected state — stop
+            if myRoundId ~= roundId then break end
+            if state == STATE.WAITING or state == STATE.IDLE then break end
             local cur = getTargetName()
             if cur ~= name then break end
             local p = Players:FindFirstChild(name)
@@ -151,26 +157,28 @@ local function attemptKill(name, source)
         if isWhitelisted(name) then return end
         if not hasKnife() then return end
         if state == STATE.WAITING and not maxCoinsReached then
-            log("holding last player — waiting for bag full")
+            log("holding last player")
             return
         end
         if state == STATE.IDLE then state = STATE.KILLING end
 
-        log(string.format("attemptKill [%s] target=%s kills=%d/%d", source, name, killCount, killCap))
+        log(string.format("[%s] target=%s kills=%d/%d", source, name, killCount, killCap))
 
-        -- cap check: if we've already hit the cap, protect last player
-        if state == STATE.KILLING and killCount >= killCap then
-            state = STATE.WAITING
-            log("cap already met — switching to WAITING")
-            if maxCoinsReached then
-                state = STATE.FINAL
-                rawFire(name)
-                rapidKill(name)
+        if state == STATE.KILLING then
+            if killCount >= killCap then
+                state = STATE.WAITING
+                log("cap met on attemptKill — WAITING")
+                if maxCoinsReached then
+                    state = STATE.FINAL
+                    rawFire(name)
+                    rapidKill(name)
+                end
+                return
             end
-            return
-        end
+            rawFire(name)
+            rapidKill(name)
 
-        if state == STATE.KILLING or state == STATE.FINAL then
+        elseif state == STATE.FINAL then
             rawFire(name)
             rapidKill(name)
         end
@@ -178,14 +186,25 @@ local function attemptKill(name, source)
 end
 
 local function startRound()
-    -- snapshot player count now: total - self - 1 (last to leave alive)
-    local total = #Players:GetPlayers()
-    killCap = math.max(total - 2, 0)
+    if roundStarted then return end  -- already started this round
+    roundStarted = true
+    roundId += 1  -- invalidates all previous watchForKillConfirm and rapidKill loops
+    killCap = math.max(#Players:GetPlayers() - 2, 0)
     killCount = 0
     maxCoinsReached = false
     activeKillName = nil
     state = STATE.KILLING
-    log(string.format("round start — %d players, kill cap: %d", total, killCap))
+    log(string.format("round start — cap=%d (roundId=%d)", killCap, roundId))
+end
+
+local function resetRound()
+    roundStarted = false
+    state = STATE.IDLE
+    maxCoinsReached = false
+    activeKillName = nil
+    killCount = 0
+    killCap = 0
+    log("round reset")
 end
 
 local function onKnifeDetected()
@@ -258,17 +277,13 @@ task.spawn(function()
     end
 end)
 
+-- knife gone = round over, full reset
 task.spawn(function()
     while true do
         task.wait(0.4)
         if not autoKillEnabled then continue end
         if not hasKnife() and state ~= STATE.IDLE then
-            log("knife gone — resetting")
-            state = STATE.IDLE
-            maxCoinsReached = false
-            activeKillName = nil
-            killCount = 0
-            killCap = 0
+            resetRound()
         end
     end
 end)
@@ -296,8 +311,7 @@ task.spawn(function()
 
             if max > 0 and current >= max then
                 maxCoinsReached = true
-                log(string.format("bag full (%d/%d) — killing last target", current, max))
-
+                log(string.format("bag full (%d/%d)", current, max))
                 if state == STATE.WAITING then
                     local name = getTargetName()
                     if name then
@@ -314,11 +328,7 @@ end)
 section:AddToggle("Auto-Kill All", function(v)
     task.spawn(function()
         autoKillEnabled = v
-        state = STATE.IDLE
-        maxCoinsReached = false
-        activeKillName = nil
-        killCount = 0
-        killCap = 0
+        resetRound()
         shared.Notify(v and "Assassin enabled" or "Assassin disabled", 2)
     end)
 end)
