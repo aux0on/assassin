@@ -46,13 +46,21 @@ local function trackPersistent(c)
 end
 
 -- // resetRound only resets kill-state, never touches persistent connections
-local function resetRound()
+-- // killSelf: if true, also kills the local character so the game respawns us
+local function resetRound(killSelf)
     roundStarted    = false
     state           = STATE.IDLE
     coinsThisRound  = 0
     activeKillName  = nil
     killThreadActive = false
     log("round reset")
+    if killSelf then
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            hum.Health = 0
+        end
+    end
 end
 
 -- ============================================================
@@ -92,27 +100,31 @@ local function getKillPart(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
+-- returns two counts: total living nearby, killable living nearby (excludes whitelisted)
 local function getLivingCount()
     local myChar = player.Character
-    if not myChar then return 0 end
+    if not myChar then return 0, 0 end
     local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return 0 end
-    local n = 0
+    if not myRoot then return 0, 0 end
+    local total, killable = 0, 0
     for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and not isWhitelisted(p) and p.Character then
+        if p ~= player and p.Character then
             local pRoot = p.Character:FindFirstChild("HumanoidRootPart")
             if pRoot then
                 local dist = (pRoot.Position - myRoot.Position).Magnitude
                 if dist <= 500 then
                     local hum = p.Character:FindFirstChildOfClass("Humanoid")
                     if hum and hum.Health > 0 then
-                        n += 1
+                        total += 1
+                        if not isWhitelisted(p) then
+                            killable += 1
+                        end
                     end
                 end
             end
         end
     end
-    return n
+    return total, killable
 end
 
 local function getTargetName()
@@ -167,9 +179,10 @@ local function rapidKill(name, myRoundId)
                 log("coins met — FINAL")
             end
 
-            if getLivingCount() <= 1 then
+            local _, killable = getLivingCount()
+            if killable <= 1 then
                 if autoKillReset then
-                    resetRound()
+                    resetRound(true)
                     break
                 end
                 if not coinThresholdMet() then
@@ -199,12 +212,13 @@ local function attemptKill(name, source)
     task.spawn(function()
         if not autoKillEnabled then return end
         if not name or name == "" then return end
-        if isWhitelisted(name) then return end
         if not hasKnife() then return end
+        -- if this specific target is whitelisted, skip silently and wait for target to change
+        if isWhitelisted(name) then return end
 
-        local living = getLivingCount()
+        local total, killable = getLivingCount()
 
-        -- autoKillReset: hold until 50 coins, kill everyone except last, then reset
+        -- autoKillReset: hold until 50 coins, kill everyone except last killable, then reset
         if autoKillReset then
             if not coinThresholdMet() then
                 if state == STATE.KILLING or state == STATE.IDLE then
@@ -212,10 +226,9 @@ local function attemptKill(name, source)
                 end
                 return
             end
-            -- coins met — kill freely until only 1 left, then reset
-            if living <= 1 then
-                resetRound()
-                log("autoKillReset — last player reached, resetting")
+            if killable <= 1 then
+                resetRound(true)
+                log("autoKillReset — last killable player reached, resetting")
                 return
             end
             rawFire(name)
@@ -231,11 +244,11 @@ local function attemptKill(name, source)
             return
         end
 
-        -- lastPlayerEnabled: only hold on the last player
-        if living <= 1 and not coinThresholdMet() then
+        -- lastPlayerEnabled: only hold on the last killable player
+        if killable <= 1 and not coinThresholdMet() then
             if state == STATE.KILLING then
                 state = STATE.WAITING
-                log("last player, coins not met — WAITING (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
+                log("last killable player, coins not met — WAITING (" .. coinsThisRound .. "/" .. COIN_THRESHOLD .. ")")
             end
             return
         end
@@ -247,12 +260,12 @@ local function attemptKill(name, source)
 
         if state == STATE.IDLE then state = STATE.KILLING end
 
-        log(string.format("[%s] target=%s nearby=%d coins=%d", source, name, living, coinsThisRound))
+        log(string.format("[%s] target=%s killable=%d coins=%d", source, name, killable, coinsThisRound))
 
         if state == STATE.KILLING then
-            if living <= 1 and lastPlayerEnabled then
+            if killable <= 1 and lastPlayerEnabled then
                 state = STATE.WAITING
-                log("1 nearby — waiting for coins")
+                log("1 killable nearby — waiting for coins")
                 if coinThresholdMet() then
                     state = STATE.FINAL
                     rawFire(name)
@@ -278,7 +291,8 @@ local function startRound()
     activeKillName  = nil
     killThreadActive = false
     state           = STATE.KILLING
-    log(string.format("round start — nearby=%d (roundId=%d)", getLivingCount(), roundId))
+    local _, killable = getLivingCount()
+    log(string.format("round start — killable=%d (roundId=%d)", killable, roundId))
 end
 
 local function onKnifeDetected()
